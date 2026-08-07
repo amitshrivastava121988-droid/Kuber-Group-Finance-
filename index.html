@@ -411,6 +411,47 @@ function dbGetActiveLoan(memberUid){
 function dbListLoans(){ return Object.values(DB.loans); }
 function dbGetSchedule(loanId){ return DB.schedules[loanId] || []; }
 
+// A loan can only be safely edited/deleted while completely untouched — no EMI marked
+// paid, no manual interest recorded, no custom/partial payments made against it yet.
+// Once any money has moved against a loan, editing it would corrupt the member's
+// balances and history, so we block it and point the admin at recording a payment instead.
+function dbLoanIsUntouched(loanId){
+  const loan = DB.loans[loanId];
+  if(!loan) return false;
+  const schedule = DB.schedules[loanId] || [];
+  const allPending = schedule.every(s=>s.status==="Pending");
+  const noInterest = (loan.interestCollectedSoFar||0) === 0;
+  const noManualInterest = !DB.manualInterestPayments.some(p=>p.loanId===loanId);
+  const noCustomPayments = !DB.loanPayments.some(p=>p.loanId===loanId);
+  return allPending && noInterest && noManualInterest && noCustomPayments;
+}
+// FIREBASE: replace with updateDoc() on loans/{id} + rewriting the schedule subcollection
+function dbEditLoan(loanId, principal, interestRate, durationMonths){
+  const loan = DB.loans[loanId];
+  if(!loan) return { error:"Loan not found." };
+  if(!dbLoanIsUntouched(loanId)) return { error:"Can't edit this loan — one or more payments have already been recorded against it. Record a payment or contact support to correct it instead." };
+  const startDate = loan.startDate;
+  const schedule = buildSchedule(principal, interestRate, durationMonths, startDate);
+  const totalInterest = round2(schedule.reduce((s,e)=>s+e.interestPaid,0));
+  const monthlyPrincipal = round2(principal/durationMonths);
+  Object.assign(loan, { principal, interestRate, durationMonths, monthlyPrincipal, firstPayment:schedule[0].emi, lastPayment:schedule[schedule.length-1].emi, totalInterest });
+  DB.schedules[loanId] = schedule;
+  const member = DB.members[loan.memberUid];
+  if(member) member.remainingBalance = principal;
+  return { ok:true };
+}
+// FIREBASE: replace with deleteDoc() on loans/{id} + the schedule subcollection
+function dbDeleteLoan(loanId){
+  const loan = DB.loans[loanId];
+  if(!loan) return { error:"Loan not found." };
+  if(!dbLoanIsUntouched(loanId)) return { error:"Can't delete this loan — one or more payments have already been recorded against it." };
+  const member = DB.members[loan.memberUid];
+  if(member && member.activeLoanId===loanId){ member.activeLoanId=null; member.remainingBalance=0; }
+  delete DB.loans[loanId];
+  delete DB.schedules[loanId];
+  return { ok:true };
+}
+
 // FIREBASE: replace with updateDoc() on the schedule entry + members/{uid}
 function dbMarkEmiPaid(loanId, month, proofUrl){
   const sched = DB.schedules[loanId];
@@ -503,6 +544,28 @@ function dbRecordContribution(memberUid, amount, month, proofUrl, penalty){
 function dbListContributions(memberUid){
   return DB.contributions.filter(c=>c.memberUid===memberUid).sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
 }
+// FIREBASE: replace with updateDoc() on contributions/{id} + adjusting members/{uid}.totalDeposit by the delta
+function dbEditContribution(id, amount, month, penalty){
+  const c = DB.contributions.find(x=>x.id===id);
+  if(!c) return { error:"Contribution not found." };
+  penalty = round2(penalty||0);
+  const newTotal = round2((amount||0) + penalty);
+  const oldTotal = c.amount;
+  const member = DB.members[c.memberUid];
+  if(member) member.totalDeposit = round2((member.totalDeposit||0) - oldTotal + newTotal);
+  c.baseAmount = round2(amount||0); c.penalty = penalty; c.amount = newTotal; c.month = month;
+  return { ok:true };
+}
+// FIREBASE: replace with deleteDoc() on contributions/{id} + adjusting members/{uid}.totalDeposit
+function dbDeleteContribution(id){
+  const idx = DB.contributions.findIndex(x=>x.id===id);
+  if(idx<0) return { error:"Contribution not found." };
+  const c = DB.contributions[idx];
+  const member = DB.members[c.memberUid];
+  if(member) member.totalDeposit = round2((member.totalDeposit||0) - c.amount);
+  DB.contributions.splice(idx,1);
+  return { ok:true };
+}
 
 // Manually record extra/out-of-schedule interest received on an active loan
 // (e.g. interest paid separately from the regular EMI schedule).
@@ -517,6 +580,26 @@ function dbRecordManualInterest(memberUid, loanId, amount, note){
 }
 function dbListManualInterest(memberUid){
   return DB.manualInterestPayments.filter(p=>p.memberUid===memberUid).sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
+}
+// FIREBASE: replace with updateDoc() on manualInterestPayments/{id} + adjusting loans/{loanId}.interestCollectedSoFar by the delta
+function dbEditManualInterest(id, amount, note){
+  const p = DB.manualInterestPayments.find(x=>x.id===id);
+  if(!p) return { error:"Entry not found." };
+  amount = round2(amount||0);
+  const loan = DB.loans[p.loanId];
+  if(loan) loan.interestCollectedSoFar = round2((loan.interestCollectedSoFar||0) - p.amount + amount);
+  p.amount = amount; p.note = note||"";
+  return { ok:true };
+}
+// FIREBASE: replace with deleteDoc() on manualInterestPayments/{id} + adjusting loans/{loanId}.interestCollectedSoFar
+function dbDeleteManualInterest(id){
+  const idx = DB.manualInterestPayments.findIndex(x=>x.id===id);
+  if(idx<0) return { error:"Entry not found." };
+  const p = DB.manualInterestPayments[idx];
+  const loan = DB.loans[p.loanId];
+  if(loan) loan.interestCollectedSoFar = round2((loan.interestCollectedSoFar||0) - p.amount);
+  DB.manualInterestPayments.splice(idx,1);
+  return { ok:true };
 }
 
 // FIREBASE: replace with addDoc() to 'paymentSubmissions'
@@ -774,6 +857,7 @@ function render(){
     case "admin-add-edit-member": body = viewAddEditMember(); break;
     case "admin-member-detail": body = viewMemberDetail(); break;
     case "admin-give-loan": body = viewGiveLoan(); break;
+    case "admin-edit-loan": body = viewEditLoan(); break;
     case "admin-add-contribution": body = viewAddContribution(); break;
     case "admin-add-manual-interest": body = viewAddManualInterest(); break;
     case "admin-transactions": body = viewAdminTransactions(); break;
@@ -912,63 +996,89 @@ function viewAdminDashboard(){
 }
 /* --------------------------- MANUAL CONTRIBUTION / PENALTY / INTEREST --------------------------- */
 function viewAddContribution(){
+  const editing = state.editingContribId ? DB.contributions.find(c=>c.id===state.editingContribId) : null;
   const members = dbListMembers();
   const suggestedPenalty = isPastPenaltyDeadline() ? PENALTY_AMOUNT : 0;
   return `
-  <h2 class="section-title" style="margin-top:0;">Add Contribution (Manual)</h2>
-  <div class="muted" style="margin-bottom:10px;">Use this when a member has deposited their contribution outside the app (cash, bank transfer, UPI without proof upload) and you want to record it directly — with or without a late penalty.</div>
+  <h2 class="section-title" style="margin-top:0;">${editing ? "Edit Contribution" : "Add Contribution (Manual)"}</h2>
+  <div class="muted" style="margin-bottom:10px;">${editing ? "Correct the amount, penalty, or label of this contribution." : "Use this when a member has deposited their contribution outside the app (cash, bank transfer, UPI without proof upload) and you want to record it directly — with or without a late penalty."}</div>
   <label class="field-label">Member</label>
-  <select id="manualContribMember">
-    ${members.map(m=>`<option value="${m.uid}" ${state.selectedMemberUid===m.uid?"selected":""}>${m.name} (${m.userId})</option>`).join("")}
+  <select id="manualContribMember" ${editing?"disabled":""}>
+    ${members.map(m=>`<option value="${m.uid}" ${(editing?editing.memberUid:state.selectedMemberUid)===m.uid?"selected":""}>${m.name} (${m.userId})</option>`).join("")}
   </select>
   <label class="field-label">Month / Label</label>
-  <input type="text" id="manualContribMonth" value="${currentMonthLabel()}" />
+  <input type="text" id="manualContribMonth" value="${editing?editing.month:currentMonthLabel()}" />
   <label class="field-label">Contribution Amount (₹)</label>
-  <input type="number" id="manualContribAmount" value="${CONTRIBUTION_AMOUNT}" />
+  <input type="number" id="manualContribAmount" value="${editing?editing.baseAmount:CONTRIBUTION_AMOUNT}" />
   <label class="field-label">Penalty (₹) <span class="muted" style="font-weight:400;">— set 0 if paid on time</span></label>
-  <input type="number" id="manualContribPenalty" value="${suggestedPenalty}" />
-  ${suggestedPenalty ? `<div class="muted" style="font-size:11px;margin-top:-4px;">Suggested because today is past the ${PENALTY_DEADLINE_DAY}th of the month — edit or clear if it doesn't apply.</div>` : ""}
-  <button class="btn" style="margin-top:14px;" onclick="submitManualContribution()">Save Contribution</button>
-  <button class="btn secondary" onclick="go(${`'admin-dashboard'`})">Cancel</button>`;
+  <input type="number" id="manualContribPenalty" value="${editing?editing.penalty:suggestedPenalty}" />
+  ${!editing && suggestedPenalty ? `<div class="muted" style="font-size:11px;margin-top:-4px;">Suggested because today is past the ${PENALTY_DEADLINE_DAY}th of the month — edit or clear if it doesn't apply.</div>` : ""}
+  <button class="btn" style="margin-top:14px;" onclick="submitManualContribution(${editing?`'${editing.id}'`:"null"})">${editing ? "Save Changes" : "Save Contribution"}</button>
+  <button class="btn secondary" onclick="go(${editing?`'admin-member-detail',{selectedMemberUid:'${editing.memberUid}'}`:`'admin-dashboard'`})">Cancel</button>`;
 }
-function submitManualContribution(){
+function submitManualContribution(editingId){
   const memberUid = document.getElementById("manualContribMember").value;
   const month = document.getElementById("manualContribMonth").value.trim() || currentMonthLabel();
   const amount = parseFloat(document.getElementById("manualContribAmount").value);
   const penalty = parseFloat(document.getElementById("manualContribPenalty").value) || 0;
   if(!memberUid){ alert("Please select a member."); return; }
   if(!amount || amount<0){ alert("Please enter a valid contribution amount."); return; }
-  dbRecordContribution(memberUid, amount, month, null, penalty);
+  if(editingId){
+    const res = dbEditContribution(editingId, amount, month, penalty);
+    if(res && res.error){ alert(res.error); return; }
+  } else {
+    dbRecordContribution(memberUid, amount, month, null, penalty);
+  }
   go("admin-member-detail", {selectedMemberUid:memberUid});
+}
+function deleteContribution(id, memberUid){
+  if(!confirm("Delete this contribution entry? This will also reduce the member's total deposit.")) return;
+  const res = dbDeleteContribution(id);
+  if(res && res.error){ alert(res.error); return; }
+  render();
 }
 
 function viewAddManualInterest(){
-  const loans = dbListLoans().filter(l=>l.status==="Active");
+  const editing = state.editingInterestId ? DB.manualInterestPayments.find(p=>p.id===state.editingInterestId) : null;
+  const loans = editing ? dbListLoans() : dbListLoans().filter(l=>l.status==="Active");
   return `
-  <h2 class="section-title" style="margin-top:0;">Add Loan Interest Payment (Manual)</h2>
-  <div class="muted" style="margin-bottom:10px;">Use this to record extra / out-of-schedule interest received on a member's active loan (separate from the regular EMI schedule).</div>
+  <h2 class="section-title" style="margin-top:0;">${editing ? "Edit Interest Payment" : "Add Loan Interest Payment (Manual)"}</h2>
+  <div class="muted" style="margin-bottom:10px;">${editing ? "Correct the amount or note of this manual interest entry." : "Use this to record extra / out-of-schedule interest received on a member's active loan (separate from the regular EMI schedule)."}</div>
   ${loans.length ? `
   <label class="field-label">Member / Loan</label>
-  <select id="manualInterestLoan">
-    ${loans.map(l=>{ const mm=DB.members[l.memberUid]; return `<option value="${l.id}" ${state.selectedMemberUid===l.memberUid?"selected":""}>${mm?mm.name:"Unknown"} — ${fmt(l.principal)} loan</option>`; }).join("")}
+  <select id="manualInterestLoan" ${editing?"disabled":""}>
+    ${loans.map(l=>{ const mm=DB.members[l.memberUid]; return `<option value="${l.id}" ${(editing?editing.loanId:null)===l.id || (!editing && state.selectedMemberUid===l.memberUid) ? "selected":""}>${mm?mm.name:"Unknown"} — ${fmt(l.principal)} loan</option>`; }).join("")}
   </select>
   <label class="field-label">Interest Amount (₹)</label>
-  <input type="number" id="manualInterestAmount" placeholder="e.g. 500" />
+  <input type="number" id="manualInterestAmount" value="${editing?editing.amount:""}" placeholder="e.g. 500" />
   <label class="field-label">Note (optional)</label>
-  <input type="text" id="manualInterestNote" placeholder="e.g. Extra interest for delayed payment" />
-  <button class="btn" style="margin-top:14px;" onclick="submitManualInterest()">Save Interest Payment</button>
-  <button class="btn secondary" onclick="go('admin-dashboard')">Cancel</button>
+  <input type="text" id="manualInterestNote" value="${editing?(editing.note||""):""}" placeholder="e.g. Extra interest for delayed payment" />
+  <button class="btn" style="margin-top:14px;" onclick="submitManualInterest(${editing?`'${editing.id}'`:"null"})">${editing ? "Save Changes" : "Save Interest Payment"}</button>
+  <button class="btn secondary" onclick="go(${editing?`'admin-member-detail',{selectedMemberUid:'${editing.memberUid}'}`:`'admin-dashboard'`})">Cancel</button>
   ` : `<div class="empty-state">No active loans right now.</div><button class="btn secondary" style="margin-top:10px;" onclick="go('admin-dashboard')">Back</button>`}`;
 }
-function submitManualInterest(){
-  const loanId = document.getElementById("manualInterestLoan").value;
+function submitManualInterest(editingId){
   const amount = parseFloat(document.getElementById("manualInterestAmount").value);
   const note = document.getElementById("manualInterestNote").value.trim();
   if(!amount || amount<=0){ alert("Please enter a valid interest amount."); return; }
-  const loan = DB.loans[loanId];
-  if(!loan) return;
-  dbRecordManualInterest(loan.memberUid, loanId, amount, note);
-  go("admin-member-detail", {selectedMemberUid:loan.memberUid});
+  if(editingId){
+    const entry = DB.manualInterestPayments.find(p=>p.id===editingId);
+    const res = dbEditManualInterest(editingId, amount, note);
+    if(res && res.error){ alert(res.error); return; }
+    go("admin-member-detail", {selectedMemberUid:entry.memberUid});
+  } else {
+    const loanId = document.getElementById("manualInterestLoan").value;
+    const loan = DB.loans[loanId];
+    if(!loan) return;
+    dbRecordManualInterest(loan.memberUid, loanId, amount, note);
+    go("admin-member-detail", {selectedMemberUid:loan.memberUid});
+  }
+}
+function deleteManualInterest(id, memberUid){
+  if(!confirm("Delete this interest entry? This will also reduce the loan's interest collected total.")) return;
+  const res = dbDeleteManualInterest(id);
+  if(res && res.error){ alert(res.error); return; }
+  render();
 }
 
 function approveSubmission(id){
@@ -1243,7 +1353,13 @@ function viewMemberDetail(){
 
   ${loan ? `
   <div class="card">
-    <h2 class="section-title" style="margin-top:0;">Active Loan</h2>
+    <div class="row-between">
+      <h2 class="section-title" style="margin-top:0;">Active Loan</h2>
+      <div style="display:flex;gap:10px;">
+        <a onclick="go('admin-edit-loan',{editingLoanId:'${loan.id}'})">Edit</a>
+        <a style="color:var(--danger);" onclick="confirmDeleteLoan('${loan.id}')">Delete</a>
+      </div>
+    </div>
     <div class="muted">Principal: ${fmt(loan.principal)}</div>
     <div class="muted">Interest Rate: ${loan.interestRate}% / month (on remaining balance)</div>
     <div class="muted">Fixed Monthly Principal: ${fmt(loan.monthlyPrincipal)} • Duration: ${loan.durationMonths} months</div>
@@ -1277,7 +1393,15 @@ function viewMemberDetail(){
       <h2 class="section-title" style="margin-top:0;">Contribution History</h2>
       <button class="btn small" style="width:auto;padding:6px 12px;" onclick="go('admin-add-contribution',{selectedMemberUid:'${m.uid}'})">+ Add</button>
     </div>
-    ${contribs.length ? contribs.map(c=>`<div class="list-row"><div>${c.month}${c.penalty?` <span class="badge overdue" style="margin-left:4px;">+${fmt(c.penalty)} penalty</span>`:""}</div><div>${fmt(c.amount)}</div></div>`).join("") : `<div class="muted">No contributions recorded yet.</div>`}
+    ${contribs.length ? contribs.map(c=>`
+      <div class="list-row">
+        <div>${c.month}${c.penalty?` <span class="badge overdue" style="margin-left:4px;">+${fmt(c.penalty)} penalty</span>`:""}</div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span>${fmt(c.amount)}</span>
+          <a style="font-size:11px;" onclick="go('admin-add-contribution',{editingContribId:'${c.id}'})">Edit</a>
+          <a style="font-size:11px;color:var(--danger);" onclick="deleteContribution('${c.id}','${m.uid}')">Delete</a>
+        </div>
+      </div>`).join("") : `<div class="muted">No contributions recorded yet.</div>`}
   </div>
   ${loan ? `
   <div class="card">
@@ -1285,7 +1409,15 @@ function viewMemberDetail(){
       <h2 class="section-title" style="margin-top:0;">Manual Interest Payments</h2>
       <button class="btn small" style="width:auto;padding:6px 12px;" onclick="go('admin-add-manual-interest',{selectedMemberUid:'${m.uid}'})">+ Add</button>
     </div>
-    ${dbListManualInterest(m.uid).length ? dbListManualInterest(m.uid).map(p=>`<div class="list-row"><div>${p.note||"Interest received"}</div><div>${fmt(p.amount)}</div></div>`).join("") : `<div class="muted">No manual interest entries yet.</div>`}
+    ${dbListManualInterest(m.uid).length ? dbListManualInterest(m.uid).map(p=>`
+      <div class="list-row">
+        <div>${p.note||"Interest received"}</div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span>${fmt(p.amount)}</span>
+          <a style="font-size:11px;" onclick="go('admin-add-manual-interest',{editingInterestId:'${p.id}'})">Edit</a>
+          <a style="font-size:11px;color:var(--danger);" onclick="deleteManualInterest('${p.id}','${m.uid}')">Delete</a>
+        </div>
+      </div>`).join("") : `<div class="muted">No manual interest entries yet.</div>`}
   </div>` : ""}
 
   ${allLoans.length ? `
@@ -1365,6 +1497,55 @@ function submitLoan(){
   dbGiveLoan(state.selectedMemberUid, p, r, n);
   alert("Loan approved and EMI schedule generated.");
   go("admin-member-detail",{selectedMemberUid:state.selectedMemberUid});
+}
+
+/* ------------------------------ EDIT / DELETE LOAN -------------------------------- */
+function viewEditLoan(){
+  const loanId = state.editingLoanId;
+  const loan = DB.loans[loanId];
+  if(!loan) return `<div class="empty-state">Loan not found.</div>`;
+  const m = DB.members[loan.memberUid];
+  if(!dbLoanIsUntouched(loanId)){
+    return `
+    <h2 class="section-title" style="margin-top:0;">Edit Loan</h2>
+    <div class="banner" style="background:#FBE1E1;border-color:#F0B0B0;color:var(--danger);">🚫 This loan can't be edited anymore — one or more EMI payments / interest / repayments have already been recorded against it. Editing now would corrupt ${m?m.name:"the member"}'s balance history.</div>
+    <div class="muted" style="margin-top:8px;">If something was entered wrong, use "Make a Payment" or the loan interest / contribution tools to correct the balance going forward instead.</div>
+    <button class="btn secondary" style="margin-top:14px;" onclick="go('admin-member-detail',{selectedMemberUid:'${loan.memberUid}'})">Back</button>`;
+  }
+  return `
+  <h2 class="section-title" style="margin-top:0;">Edit Loan — ${m?m.name:""}</h2>
+  <div class="muted" style="margin-bottom:10px;">No payments have been recorded on this loan yet, so it's safe to correct any mistakes.</div>
+  <label class="field-label">Loan Amount (₹)</label>
+  <input type="number" id="editLoanPrincipal" value="${loan.principal}" />
+  <label class="field-label">Interest Rate (% per month)</label>
+  <input type="number" id="editLoanRate" value="${loan.interestRate}" />
+  <label class="field-label">Duration (months)</label>
+  <input type="number" id="editLoanDuration" value="${loan.durationMonths}" />
+  <button class="btn" style="margin-top:14px;" onclick="submitEditLoan('${loanId}')">Save Changes</button>
+  <button class="btn secondary" onclick="go('admin-member-detail',{selectedMemberUid:'${loan.memberUid}'})">Cancel</button>`;
+}
+function submitEditLoan(loanId){
+  const p = parseFloat(document.getElementById("editLoanPrincipal").value);
+  const r = parseFloat(document.getElementById("editLoanRate").value);
+  const n = parseInt(document.getElementById("editLoanDuration").value,10);
+  if(!p||p<=0||!r||!n||n<=0){ alert("Please enter valid loan amount, interest rate, and duration."); return; }
+  const loan = DB.loans[loanId];
+  const memberUid = loan.memberUid;
+  const bank = dbAvailableBankBalance();
+  const availableIncludingThisLoan = round2(bank.available + loan.principal); // this loan's old amount is already subtracted from bank.available
+  if(p > availableIncludingThisLoan){ alert(`Cannot set this amount. Available bank balance (including this loan's current amount) is only ${fmt(availableIncludingThisLoan)}.`); return; }
+  const res = dbEditLoan(loanId, p, r, n);
+  if(res && res.error){ alert(res.error); return; }
+  go("admin-member-detail", {selectedMemberUid:memberUid});
+}
+function confirmDeleteLoan(loanId){
+  const loan = DB.loans[loanId];
+  if(!loan) return;
+  if(!confirm("Delete this loan entirely? This can't be undone.")) return;
+  const memberUid = loan.memberUid;
+  const res = dbDeleteLoan(loanId);
+  if(res && res.error){ alert(res.error); return; }
+  go("admin-member-detail", {selectedMemberUid:memberUid});
 }
 
 /* ------------------------------ LOAN PAYMENTS -------------------------------- */
@@ -1606,177 +1787,4 @@ function viewMemberDashboard(){
     <input type="text" id="myBdIfsc" value="${(m.paymentDetails&&m.paymentDetails.ifsc)||''}" placeholder="e.g. HDFC0001234" />
     <label class="field-label">UPI ID</label>
     <input type="text" id="myBdUpi" value="${(m.paymentDetails&&m.paymentDetails.upi)||''}" placeholder="e.g. yourname@upi" />
-    <label class="field-label">QR Code Image (optional)</label>
-    <input type="file" id="myBdQrFile" accept="image/*" onchange="previewMyBankQr()" />
-    <div id="myBdQrPreview" style="margin-top:10px;">${(m.paymentDetails&&m.paymentDetails.qrImage)?`<img src="${m.paymentDetails.qrImage}" class="chat-img" style="max-height:180px;"/>`:""}</div>
-    <button class="btn" onclick="saveMyPaymentDetails()">Save My Details</button>
-  </div>`;
-}
-let pendingMyBankQrBase64 = null;
-async function previewMyBankQr(){
-  const file = document.getElementById("myBdQrFile").files[0];
-  if(!file) return;
-  pendingMyBankQrBase64 = await fileToBase64(file);
-  document.getElementById("myBdQrPreview").innerHTML = `<img src="${pendingMyBankQrBase64}" class="chat-img" style="max-height:180px;"/>`;
-}
-function saveMyPaymentDetails(){
-  const u = currentUser();
-  const details = {
-    accountHolder: document.getElementById("myBdHolder").value.trim(),
-    bankName: document.getElementById("myBdBank").value.trim(),
-    accountNumber: document.getElementById("myBdAccNo").value.trim(),
-    ifsc: document.getElementById("myBdIfsc").value.trim(),
-    upi: document.getElementById("myBdUpi").value.trim(),
-  };
-  if(pendingMyBankQrBase64) details.qrImage = pendingMyBankQrBase64;
-  dbUpdateMemberPaymentDetails(u.uid, details);
-  pendingMyBankQrBase64 = null;
-  alert("Your payment details are saved. The admin can now see them to transfer money to you.");
-  render();
-}
-
-function viewMemberLoan(){
-  const u = currentUser();
-  const loan = dbGetActiveLoan(u.uid);
-  const allLoans = dbListLoans().filter(l=>l.memberUid===u.uid).sort((a,b)=> new Date(b.startDate)-new Date(a.startDate));
-  const closedLoans = allLoans.filter(l=>l.status==="Closed");
-  const closedLoansHtml = closedLoans.length ? `
-    <h2 class="section-title">Closed Loans</h2>
-    ${closedLoans.map(l=>`
-      <div class="card">
-        <div class="row-between">
-          <div><div style="font-weight:700;">${fmt(l.principal)}</div><div class="muted">Closed ${new Date(l.closedDate).toLocaleDateString()}${l.closedEarly?' (Foreclosed)':''}</div></div>
-          <a onclick="generateNOC('${l.id}')">Download NOC</a>
-        </div>
-      </div>`).join("")}` : "";
-  if(!loan) return `<div class="empty-state">You don't have an active loan right now.</div>${closedLoansHtml}`;
-  const schedule = dbGetSchedule(loan.id);
-  return `
-  <div class="card" style="background:var(--primary);color:#fff;border:none;">
-    <div style="font-size:12px;opacity:.85;">Loan Amount</div>
-    <div style="font-size:24px;font-weight:800;margin:4px 0 12px;">${fmt(loan.principal)}</div>
-    <div style="display:flex;justify-content:space-between;">
-      <div><div style="font-weight:800;">${fmt(loan.monthlyPrincipal)}</div><div style="font-size:10px;opacity:.85;">Fixed Principal/mo</div></div>
-      <div><div style="font-weight:800;">${loan.interestRate}%/mo</div><div style="font-size:10px;opacity:.85;">Rate (on balance)</div></div>
-      <div><div style="font-weight:800;">${loan.durationMonths} mo</div><div style="font-size:10px;opacity:.85;">Duration</div></div>
-    </div>
-  </div>
-  <div class="banner">💡 Your monthly payment goes down over time — interest is charged only on your remaining balance, which shrinks every month.</div>
-  <h2 class="section-title">Repayment Schedule</h2>
-  ${schedule.map(s=>{
-    const overdue = s.status!=="Paid" && isOverdue(s.dueDate);
-    return `<div class="card">
-      <div class="row-between">
-        <div>
-          <div style="font-weight:700;">Month ${s.month}</div>
-          <div class="muted">Due: ${new Date(s.dueDate).toLocaleDateString()}</div>
-        </div>
-        <span class="badge ${s.status==='Paid'?'paid':overdue?'overdue':'pending'}">${s.status==='Paid'?'Paid':overdue?'Overdue':'Pending'}</span>
-      </div>
-      <div class="row-between" style="margin-top:8px;">
-        <div class="muted">Principal ${fmt(s.principalPaid)} + Interest ${fmt(s.interestPaid)}</div>
-        <div style="font-weight:800;">${fmt(s.emi)}</div>
-      </div>
-      ${s.status!=="Paid" ? `<div style="text-align:right;margin-top:4px;"><a onclick="go('member-upload',{proofFor:'emi',proofLoanId:'${loan.id}',proofMonth:${s.month}})">Upload Proof</a></div>` : ""}
-    </div>`;
-  }).join("")}
-  ${renderBankDetailsCard()}
-  ${closedLoansHtml}`;
-}
-
-function viewMemberHistory(){
-  const u = currentUser();
-  const contribs = dbListContributions(u.uid).map(c=>({type:"Contribution", amount:c.amount, label:c.month+(c.penalty?` (incl. ${fmt(c.penalty)} penalty)`:""), status:"Paid"}));
-  const loan = dbGetActiveLoan(u.uid);
-  const emis = loan ? dbGetSchedule(loan.id).map(s=>({type:"EMI Payment", amount:s.emi, label:"Month "+s.month, status:s.status})) : [];
-  const items = [...contribs, ...emis];
-  return items.length ? items.map(i=>`
-    <div class="card">
-      <div class="row-between">
-        <div><div style="font-weight:700;">${i.type}</div><div class="muted">${i.label}</div></div>
-        <div style="font-weight:700;">${fmt(i.amount)}</div>
-        <span class="badge ${i.status==='Paid'?'paid':'pending'}">${i.status}</span>
-      </div>
-    </div>`).join("") : `<div class="empty-state">No payment history yet.</div>`;
-}
-
-function viewUploadProof(){
-  const label = state.proofFor==="emi" ? `Upload proof for Month ${state.proofMonth} EMI` : "Upload Contribution Proof";
-  const showPenaltyWarning = state.proofFor!=="emi" && isPastPenaltyDeadline();
-  return `
-  <h2 class="section-title" style="margin-top:0;">${label}</h2>
-  ${showPenaltyWarning ? `<div class="banner" style="background:#FBE1E1;border-color:#F0B0B0;color:var(--danger);">⚠️ Contributions must be deposited by the ${PENALTY_DEADLINE_DAY}th of the month. Since it's past that date, a ${fmt(PENALTY_AMOUNT)} late penalty will be added to your ${fmt(CONTRIBUTION_AMOUNT)} contribution once approved.</div>` : ""}
-  <input type="file" id="proofFile" accept="image/*" onchange="previewProof()" />
-  <div id="proofPreview" style="margin-top:10px;"></div>
-  <button class="btn" onclick="submitProof()">Submit for Review</button>
-  <button class="btn secondary" onclick="go(${isAdmin()?"'admin-dashboard'":"'member-dashboard'"})">Cancel</button>`;
-}
-let pendingProofBase64 = null;
-async function previewProof(){
-  const file = document.getElementById("proofFile").files[0];
-  if(!file) return;
-  pendingProofBase64 = await fileToBase64(file);
-  document.getElementById("proofPreview").innerHTML = `<img src="${pendingProofBase64}" class="chat-img" style="max-height:200px;"/>`;
-}
-function submitProof(){
-  if(!pendingProofBase64){ alert("Please select a payment screenshot first."); return; }
-  const u = currentUser();
-  if(state.proofFor==="emi"){
-    dbSubmitProof(u.uid, "EMI", state.proofLoanId, state.proofMonth, pendingProofBase64);
-  } else {
-    dbSubmitProof(u.uid, "Contribution", null, currentMonthLabel(), pendingProofBase64);
-  }
-  pendingProofBase64 = null;
-  alert("Submitted for admin review. It will reflect in your account once approved.");
-  go(isAdmin() ? "admin-dashboard" : "member-dashboard");
-}
-
-/* ---------------------------------- CHAT ------------------------------------ */
-function viewChat(){
-  const u = currentUser();
-  const messages = DB.chat.map(msg=>{
-    const mine = msg.senderUid===u.uid;
-    return `<div class="chat-bubble-wrap" style="justify-content:${mine?'flex-end':'flex-start'};">
-      <div class="chat-bubble ${mine?'mine':'other'}">
-        ${!mine ? `<div class="chat-sender">${msg.senderName}</div>` : ""}
-        ${msg.imageUrl ? `<img src="${msg.imageUrl}" class="chat-img"/>` : `<div>${msg.text}</div>`}
-        ${isAdmin() ? `<div style="text-align:right;margin-top:4px;"><a style="font-size:10px;color:${mine?'#cfe0ff':'var(--danger)'};" onclick="deleteMsg('${msg.id}')">delete</a></div>` : ""}
-      </div>
-    </div>`;
-  }).join("");
-  setTimeout(()=>{ const c=document.getElementById("chatScroll"); if(c) c.scrollTop=c.scrollHeight; },0);
-  return `
-  <div id="chatScroll" style="max-height:60vh;overflow-y:auto;margin-bottom:10px;">
-    ${messages || `<div class="empty-state">No messages yet. Say hello 👋</div>`}
-  </div>
-  <div class="chat-input-row" style="position:relative;">
-    <input type="file" id="chatImgInput" accept="image/*" style="display:none;" onchange="sendChatImage()" />
-    <button class="icon-btn" style="color:var(--primary);" onclick="document.getElementById('chatImgInput').click()">🖼️</button>
-    <input type="text" id="chatText" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendChatText();" />
-    <button class="icon-btn" style="background:var(--primary);border-radius:50%;" onclick="sendChatText()">➤</button>
-  </div>`;
-}
-function sendChatText(){
-  const u = currentUser();
-  const el = document.getElementById("chatText");
-  const text = el.value.trim();
-  if(!text) return;
-  dbSendChat(u.uid, u.name, text, null);
-  el.value = "";
-  render();
-}
-async function sendChatImage(){
-  const u = currentUser();
-  const file = document.getElementById("chatImgInput").files[0];
-  if(!file) return;
-  const base64 = await fileToBase64(file);
-  dbSendChat(u.uid, u.name, null, base64);
-  render();
-}
-function deleteMsg(id){ dbDeleteChat(id); render(); }
-
-/* ---------------------------------- BOOT ------------------------------------ */
-startApp();
-</script>
-</body>
-</html>
+    <label class=
