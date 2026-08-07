@@ -673,7 +673,6 @@ const state = {
   currentUid: null,
   view: "login",
   selectedMemberUid: null,
-  showDemoAccounts: false,
   transFilter: "All",
   darkMode: false,
 };
@@ -776,7 +775,6 @@ function go(view, extra){
 
 /* ----------------------------------- LOGIN --------------------------------- */
 function viewLogin(){
-  const demoRows = DB.users.map(u=>`<tr><td>${u.role}</td><td>${u.name}</td><td>${u.mobile}</td><td>${u.password}</td></tr>`).join("");
   return `
   <div style="display:flex;justify-content:flex-end;padding:10px 16px 0;">
     <button class="theme-toggle" style="background:${state.darkMode?'#2C3A52':'#EEF3FC'};color:${state.darkMode?'#EAF0FF':'#0D47A1'};" onclick="toggleDarkMode()" title="Toggle dark mode">${state.darkMode ? "☀️ Light" : "🌙 Dark"}</button>
@@ -795,13 +793,6 @@ function viewLogin(){
       <div id="loginError" style="color:var(--danger);font-size:12px;margin-top:8px;"></div>
     </div>
 
-    <span class="toggle-link" onclick="toggleDemo()">${state.showDemoAccounts ? "Hide" : "Show"} demo accounts</span>
-    ${state.showDemoAccounts ? `
-      <table class="demo-table">
-        <tr><th>Role</th><th>Name</th><th>Mobile</th><th>Password</th></tr>
-        ${demoRows}
-      </table>` : ""}
-
     ${!CLOUD_SYNC_ENABLED ? `<div class="code-note">
       ⚠️ Cloud sync isn't set up yet — data lives only in this browser tab
       and resets on reload / isn't shared across devices. Fill in
@@ -810,7 +801,6 @@ function viewLogin(){
     </div>` : ""}
   </div>`;
 }
-function toggleDemo(){ state.showDemoAccounts = !state.showDemoAccounts; render(); }
 function doLogin(){
   const mobile = normalizeMobile(document.getElementById("loginMobile").value);
   const password = document.getElementById("loginPassword").value.trim();
