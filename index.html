@@ -179,19 +179,25 @@
 <body>
 <div id="app"></div>
 
+<!-- Firebase (used only for cross-device cloud sync — see the "CLOUD SYNC
+     (FIREBASE)" comment block inside the script below for setup steps).
+     Loading these is harmless even if you never fill in a config: the app
+     just falls back to local-only mode. -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
 <script>
 /* =========================================================================
-   GROUP FINANCE MANAGER — STANDALONE DEMO BUILD
+   GROUP FINANCE MANAGER
    =========================================================================
    This single HTML file runs the FULL app UI/logic in the browser using an
-   in-memory JavaScript object as the "database" (see DB below). No backend,
-   no Firebase, no GitHub needed to try it out.
+   in-memory JavaScript object as the "database" (see DB below). By default
+   (no Firebase config filled in) data lives only in this browser tab and
+   resets on reload — a zero-setup demo mode.
 
-   >>> DATA RESETS ON PAGE RELOAD. <<< This is intentional for a zero-setup
-   demo. When you're ready to make data persistent and multi-device, swap
-   the functions inside the "DATA LAYER" section for real Firebase Firestore
-   / Auth / Storage calls — every function below is written to mirror what
-   the Firestore version does (see the comments marked "FIREBASE:" ).
+   Fill in FIREBASE_CONFIG (see the "CLOUD SYNC (FIREBASE)" block further
+   down) to make data persistent AND shared live across every device.
    ========================================================================= */
 
 /* ------------------------------- UTILITIES ------------------------------- */
@@ -284,10 +290,11 @@ const DB = {
   members: {},          // uid -> {uid, userId, name, mobile, totalDeposit, remainingBalance, activeLoanId}
   loans: {},            // loanId -> {id, memberUid, principal, interestRate, durationMonths, emi, totalInterest, interestCollectedSoFar, status, startDate}
   schedules: {},        // loanId -> [ {month, emi, principalPaid, interestPaid, balance, dueDate, status, proofUrl} ]
-  contributions: [],    // {id, memberUid, amount, month, paidAt, proofUrl}
+  contributions: [],    // {id, memberUid, amount, baseAmount, penalty, month, paidAt, proofUrl}
   submissions: [],      // {id, memberUid, type, loanId, month, proofUrl(base64), status, submittedAt}
   chat: [],             // {id, senderUid, senderName, text, imageUrl(base64), createdAt}
   loanPayments: [],     // {id, loanId, memberUid, amount, interestPortion, principalPortion, balanceAfter, paidAt, closedLoan}
+  manualInterestPayments: [], // {id, loanId, memberUid, amount, note, paidAt} — extra/out-of-schedule interest recorded manually
   settings: {
     defaultInterestRate: 2,
     bankDetails: { accountHolder:"", bankName:"", accountNumber:"", ifsc:"", upi:"", qrImage:null }
@@ -467,6 +474,21 @@ function dbListContributions(memberUid){
   return DB.contributions.filter(c=>c.memberUid===memberUid).sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
 }
 
+// Manually record extra/out-of-schedule interest received on an active loan
+// (e.g. interest paid separately from the regular EMI schedule).
+function dbRecordManualInterest(memberUid, loanId, amount, note){
+  const loan = DB.loans[loanId];
+  if(!loan) return null;
+  amount = round2(amount||0);
+  loan.interestCollectedSoFar = round2((loan.interestCollectedSoFar||0) + amount);
+  const entry = { id:uid("mint"), loanId, memberUid, amount, note:note||"", paidAt:timeNow() };
+  DB.manualInterestPayments.push(entry);
+  return entry;
+}
+function dbListManualInterest(memberUid){
+  return DB.manualInterestPayments.filter(p=>p.memberUid===memberUid).sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
+}
+
 // FIREBASE: replace with addDoc() to 'paymentSubmissions'
 function dbSubmitProof(memberUid, type, loanId, month, proofUrl){
   DB.submissions.push({ id:uid("sub"), memberUid, type, loanId:loanId||null, month:month||null, proofUrl, status:"PendingReview", submittedAt:timeNow() });
@@ -493,7 +515,8 @@ function dbAllTransactions(){
     });
   });
   const customPays = DB.loanPayments.map(p=>({ id:p.id, type:p.closedLoan?"Loan Closure Payment":"Loan Payment (Partial)", memberUid:p.memberUid, amount:p.amount, month:`Interest ${fmt(p.interestPortion)} + Principal ${fmt(p.principalPortion)}`, paidAt:p.paidAt }));
-  return [...contribs, ...emis, ...customPays].sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
+  const manualInterest = DB.manualInterestPayments.map(p=>({ id:p.id, type:"Manual Interest Payment", memberUid:p.memberUid, amount:p.amount, month:p.note||"—", paidAt:p.paidAt }));
+  return [...contribs, ...emis, ...customPays, ...manualInterest].sort((a,b)=> new Date(b.paidAt)-new Date(a.paidAt));
 }
 function dbDashboardTotals(){
   const members = dbListMembers();
@@ -535,7 +558,115 @@ function dbAvailableBankBalance(){
 function seed(){
   DB.users.push({ uid:uid("adm"), userId:"ADM-0001", name:"Admin", mobile:"9000000001", password:"admin123", role:"admin" });
 }
-seed();
+
+/* ===========================================================================
+   CLOUD SYNC (FIREBASE) — makes data shared across every device/browser
+   ===========================================================================
+   Without this filled in, the app behaves exactly as before: everything
+   lives only in this browser tab's memory and resets on reload.
+
+   TO ENABLE CROSS-DEVICE SYNC:
+   1. Go to https://console.firebase.google.com → "Add project" (free plan
+      is enough for a small group) → finish the wizard.
+   2. In the left menu: Build → Firestore Database → "Create database" →
+      start in Production mode → pick any region → Enable.
+   3. In the left menu: Build → Authentication → "Get started" → Sign-in
+      method tab → enable "Anonymous".
+   4. Click the gear icon (⚙) → Project settings → scroll to "Your apps" →
+      click the </> (Web) icon → register an app (any nickname, no need
+      for hosting) → it will show a `firebaseConfig` object. Copy those
+      6 values into the FIREBASE_CONFIG object right below and replace
+      the "YOUR_..." placeholders.
+   5. Back in Firestore → Rules tab → replace the rules with:
+        rules_version = '2';
+        service cloud.firestore {
+          match /databases/{database}/documents {
+            match /gfm-app/{doc} {
+              allow read, write: if request.auth != null;
+            }
+          }
+        }
+      → click Publish.
+   6. Save this file / commit to GitHub. Reload the site on any device —
+      they'll all now read and write the same data in real time.
+---------------------------------------------------------------------------- */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDt-B9hVdDcuaoORkt797J4jZqigZ3spC4",
+  authDomain: "kuber-group-finance.firebaseapp.com",
+  projectId: "kuber-group-finance",
+  storageBucket: "kuber-group-finance.firebasestorage.app",
+  messagingSenderId: "26948934624",
+  appId: "1:26948934624:web:3caf4d8c62de84c1ed6985"
+};
+const CLOUD_SYNC_ENABLED = FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY" && typeof firebase !== "undefined";
+
+let cloudDocRef = null;
+let applyingRemoteUpdate = false;
+let cloudSaveTimer = null;
+
+// Debounced push of the whole in-memory DB up to Firestore. Called at the
+// top of every render() — since this app already calls render() after every
+// mutation, this one hook is enough to keep the cloud copy up to date.
+function scheduleCloudSave(){
+  if(!CLOUD_SYNC_ENABLED || !cloudDocRef || applyingRemoteUpdate) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(()=>{
+    cloudDocRef.set(DB).catch(err=>console.error("Cloud save failed:", err));
+  }, 500);
+}
+
+// Replace the local DB's contents (in place — DB is a const) with whatever
+// just arrived from Firestore, from this device or any other.
+function applyCloudSnapshot(data){
+  applyingRemoteUpdate = true;
+  DB.users = data.users || [];
+  DB.members = data.members || {};
+  DB.loans = data.loans || {};
+  DB.schedules = data.schedules || {};
+  DB.contributions = data.contributions || [];
+  DB.submissions = data.submissions || [];
+  DB.chat = data.chat || [];
+  DB.loanPayments = data.loanPayments || [];
+  DB.manualInterestPayments = data.manualInterestPayments || [];
+  DB.settings = data.settings || DB.settings;
+  DB.memberSeq = data.memberSeq || 0;
+  DB.adminSeq = data.adminSeq || 1;
+  applyingRemoteUpdate = false;
+}
+
+function startApp(){
+  if(!CLOUD_SYNC_ENABLED){
+    seed();
+    restoreSession();
+    render();
+    return;
+  }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  const authClient = firebase.auth();
+  cloudDocRef = firebase.firestore().collection("gfm-app").doc("data");
+
+  authClient.onAuthStateChanged(user=>{
+    if(!user) return;
+    cloudDocRef.onSnapshot(snap=>{
+      if(snap.exists){
+        applyCloudSnapshot(snap.data());
+      } else {
+        seed();
+        cloudDocRef.set(DB).catch(err=>console.error("Initial cloud write failed:", err));
+      }
+      restoreSession();
+      render();
+    }, err=>{
+      console.error("Cloud sync error:", err);
+      root.innerHTML = `<div class="empty-state">⚠️ Could not connect to the cloud database. Check your Firebase config / Firestore rules, or your internet connection.</div>`;
+    });
+  });
+
+  authClient.signInAnonymously().catch(err=>{
+    console.error("Anonymous sign-in failed:", err);
+    seed(); restoreSession(); render();
+  });
+}
 
 /* ---------------------------------- STATE --------------------------------- */
 const state = {
@@ -550,6 +681,29 @@ const state = {
 function currentUser(){ return DB.users.find(u=>u.uid===state.currentUid) || null; }
 function isAdmin(){ const u=currentUser(); return u && u.role==="admin"; }
 
+/* ---- SESSION PERSISTENCE: keep the user logged in across page refreshes ---- */
+const SESSION_KEY = "gfm_session_uid";
+function persistSession(){
+  try{
+    if(state.currentUid) localStorage.setItem(SESSION_KEY, state.currentUid);
+    else localStorage.removeItem(SESSION_KEY);
+  }catch(e){ /* localStorage unavailable — session just won't survive a refresh */ }
+}
+function restoreSession(){
+  try{
+    const saved = localStorage.getItem(SESSION_KEY);
+    if(saved){
+      const u = DB.users.find(x=>x.uid===saved);
+      if(u){
+        state.currentUid = saved;
+        state.view = u.role==="admin" ? "admin-dashboard" : "member-dashboard";
+      } else {
+        localStorage.removeItem(SESSION_KEY); // stale session (user no longer exists)
+      }
+    }
+  }catch(e){ /* ignore */ }
+}
+
 function toggleDarkMode(){
   state.darkMode = !state.darkMode;
   document.body.classList.toggle("dark-mode", state.darkMode);
@@ -560,6 +714,7 @@ function toggleDarkMode(){
 const root = document.getElementById("app");
 
 function render(){
+  scheduleCloudSave();
   const u = currentUser();
   if(!u){ root.innerHTML = viewLogin(); return; }
 
@@ -575,6 +730,8 @@ function render(){
     case "admin-add-edit-member": body = viewAddEditMember(); break;
     case "admin-member-detail": body = viewMemberDetail(); break;
     case "admin-give-loan": body = viewGiveLoan(); break;
+    case "admin-add-contribution": body = viewAddContribution(); break;
+    case "admin-add-manual-interest": body = viewAddManualInterest(); break;
     case "admin-transactions": body = viewAdminTransactions(); break;
     case "admin-reports": body = viewAdminReports(); break;
     case "admin-bank-details": body = viewBankDetails(); break;
@@ -645,12 +802,12 @@ function viewLogin(){
         ${demoRows}
       </table>` : ""}
 
-    <div class="code-note">
-      ⚠️ This is a local, zero-setup demo — all data lives only in this browser
-      tab's memory and resets on reload. When ready, connect a real Firebase
-      project (see the "FIREBASE:" comments throughout the JavaScript source
-      of this file) to make data persistent and shared across devices.
-    </div>
+    ${!CLOUD_SYNC_ENABLED ? `<div class="code-note">
+      ⚠️ Cloud sync isn't set up yet — data lives only in this browser tab
+      and resets on reload / isn't shared across devices. Fill in
+      FIREBASE_CONFIG near the top of the script (see the "CLOUD SYNC
+      (FIREBASE)" comment block) to fix this.
+    </div>` : ""}
   </div>`;
 }
 function toggleDemo(){ state.showDemoAccounts = !state.showDemoAccounts; render(); }
@@ -661,9 +818,10 @@ function doLogin(){
   if(!u){ document.getElementById("loginError").textContent = "Invalid mobile number or password."; return; }
   state.currentUid = u.uid;
   state.view = u.role==="admin" ? "admin-dashboard" : "member-dashboard";
+  persistSession();
   render();
 }
-function doLogout(){ state.currentUid=null; state.view="login"; render(); }
+function doLogout(){ state.currentUid=null; state.view="login"; persistSession(); render(); }
 
 /* ------------------------------ ADMIN DASHBOARD ----------------------------- */
 function viewAdminDashboard(){
@@ -712,9 +870,72 @@ function viewAdminDashboard(){
     <button class="btn outline small" style="flex:1;" onclick="go('admin-give-loan',{selectedMemberUid:null})">Give Loan</button>
     <button class="btn outline small" style="flex:1;" onclick="go('admin-reports')">Reports</button>
   </div>
+  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-add-contribution',{selectedMemberUid:null})">➕ Add Contribution / Penalty (Manual)</button>
+  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-add-manual-interest')">➕ Add Loan Interest Payment (Manual)</button>
   <button class="btn outline" style="margin-top:8px;" onclick="go('admin-bank-details')">🏦 Manage Payment / Bank Details</button>
   <button class="btn outline" style="margin-top:8px;" onclick="go('admin-manage-admins')">👥 Manage Admins</button>`;
 }
+/* --------------------------- MANUAL CONTRIBUTION / PENALTY / INTEREST --------------------------- */
+function viewAddContribution(){
+  const members = dbListMembers();
+  const suggestedPenalty = isPastPenaltyDeadline() ? PENALTY_AMOUNT : 0;
+  return `
+  <h2 class="section-title" style="margin-top:0;">Add Contribution (Manual)</h2>
+  <div class="muted" style="margin-bottom:10px;">Use this when a member has deposited their contribution outside the app (cash, bank transfer, UPI without proof upload) and you want to record it directly — with or without a late penalty.</div>
+  <label class="field-label">Member</label>
+  <select id="manualContribMember">
+    ${members.map(m=>`<option value="${m.uid}" ${state.selectedMemberUid===m.uid?"selected":""}>${m.name} (${m.userId})</option>`).join("")}
+  </select>
+  <label class="field-label">Month / Label</label>
+  <input type="text" id="manualContribMonth" value="${currentMonthLabel()}" />
+  <label class="field-label">Contribution Amount (₹)</label>
+  <input type="number" id="manualContribAmount" value="${CONTRIBUTION_AMOUNT}" />
+  <label class="field-label">Penalty (₹) <span class="muted" style="font-weight:400;">— set 0 if paid on time</span></label>
+  <input type="number" id="manualContribPenalty" value="${suggestedPenalty}" />
+  ${suggestedPenalty ? `<div class="muted" style="font-size:11px;margin-top:-4px;">Suggested because today is past the ${PENALTY_DEADLINE_DAY}th of the month — edit or clear if it doesn't apply.</div>` : ""}
+  <button class="btn" style="margin-top:14px;" onclick="submitManualContribution()">Save Contribution</button>
+  <button class="btn secondary" onclick="go(${`'admin-dashboard'`})">Cancel</button>`;
+}
+function submitManualContribution(){
+  const memberUid = document.getElementById("manualContribMember").value;
+  const month = document.getElementById("manualContribMonth").value.trim() || currentMonthLabel();
+  const amount = parseFloat(document.getElementById("manualContribAmount").value);
+  const penalty = parseFloat(document.getElementById("manualContribPenalty").value) || 0;
+  if(!memberUid){ alert("Please select a member."); return; }
+  if(!amount || amount<0){ alert("Please enter a valid contribution amount."); return; }
+  dbRecordContribution(memberUid, amount, month, null, penalty);
+  go("admin-member-detail", {selectedMemberUid:memberUid});
+}
+
+function viewAddManualInterest(){
+  const loans = dbListLoans().filter(l=>l.status==="Active");
+  return `
+  <h2 class="section-title" style="margin-top:0;">Add Loan Interest Payment (Manual)</h2>
+  <div class="muted" style="margin-bottom:10px;">Use this to record extra / out-of-schedule interest received on a member's active loan (separate from the regular EMI schedule).</div>
+  ${loans.length ? `
+  <label class="field-label">Member / Loan</label>
+  <select id="manualInterestLoan">
+    ${loans.map(l=>{ const mm=DB.members[l.memberUid]; return `<option value="${l.id}" ${state.selectedMemberUid===l.memberUid?"selected":""}>${mm?mm.name:"Unknown"} — ${fmt(l.principal)} loan</option>`; }).join("")}
+  </select>
+  <label class="field-label">Interest Amount (₹)</label>
+  <input type="number" id="manualInterestAmount" placeholder="e.g. 500" />
+  <label class="field-label">Note (optional)</label>
+  <input type="text" id="manualInterestNote" placeholder="e.g. Extra interest for delayed payment" />
+  <button class="btn" style="margin-top:14px;" onclick="submitManualInterest()">Save Interest Payment</button>
+  <button class="btn secondary" onclick="go('admin-dashboard')">Cancel</button>
+  ` : `<div class="empty-state">No active loans right now.</div><button class="btn secondary" style="margin-top:10px;" onclick="go('admin-dashboard')">Back</button>`}`;
+}
+function submitManualInterest(){
+  const loanId = document.getElementById("manualInterestLoan").value;
+  const amount = parseFloat(document.getElementById("manualInterestAmount").value);
+  const note = document.getElementById("manualInterestNote").value.trim();
+  if(!amount || amount<=0){ alert("Please enter a valid interest amount."); return; }
+  const loan = DB.loans[loanId];
+  if(!loan) return;
+  dbRecordManualInterest(loan.memberUid, loanId, amount, note);
+  go("admin-member-detail", {selectedMemberUid:loan.memberUid});
+}
+
 function approveSubmission(id){
   const s = dbResolveSubmission(id, true);
   if(s.type==="EMI") dbMarkEmiPaid(s.loanId, s.month, s.proofUrl);
@@ -980,9 +1201,20 @@ function viewMemberDetail(){
   </div>` : ""}
 
   <div class="card">
-    <h2 class="section-title" style="margin-top:0;">Contribution History</h2>
+    <div class="row-between">
+      <h2 class="section-title" style="margin-top:0;">Contribution History</h2>
+      <button class="btn small" style="width:auto;padding:6px 12px;" onclick="go('admin-add-contribution',{selectedMemberUid:'${m.uid}'})">+ Add</button>
+    </div>
     ${contribs.length ? contribs.map(c=>`<div class="list-row"><div>${c.month}${c.penalty?` <span class="badge overdue" style="margin-left:4px;">+${fmt(c.penalty)} penalty</span>`:""}</div><div>${fmt(c.amount)}</div></div>`).join("") : `<div class="muted">No contributions recorded yet.</div>`}
   </div>
+  ${loan ? `
+  <div class="card">
+    <div class="row-between">
+      <h2 class="section-title" style="margin-top:0;">Manual Interest Payments</h2>
+      <button class="btn small" style="width:auto;padding:6px 12px;" onclick="go('admin-add-manual-interest',{selectedMemberUid:'${m.uid}'})">+ Add</button>
+    </div>
+    ${dbListManualInterest(m.uid).length ? dbListManualInterest(m.uid).map(p=>`<div class="list-row"><div>${p.note||"Interest received"}</div><div>${fmt(p.amount)}</div></div>`).join("") : `<div class="muted">No manual interest entries yet.</div>`}
+  </div>` : ""}
 
   ${allLoans.length ? `
   <div class="card">
@@ -1207,7 +1439,7 @@ function viewAdminTransactions(){
   const filtered = state.transFilter==="All" ? all : all.filter(t=>t.type===state.transFilter);
   return `
   <div>
-    ${["All","Contribution","EMI Payment","Loan Payment (Partial)","Loan Closure Payment"].map(f=>`<span class="chip ${state.transFilter===f?'active':''}" onclick="state.transFilter='${f}'; render();">${f}</span>`).join("")}
+    ${["All","Contribution","EMI Payment","Loan Payment (Partial)","Loan Closure Payment","Manual Interest Payment"].map(f=>`<span class="chip ${state.transFilter===f?'active':''}" onclick="state.transFilter='${f}'; render();">${f}</span>`).join("")}
   </div>
   ${filtered.length ? filtered.map(t=>{
     const m = DB.members[t.memberUid];
@@ -1472,7 +1704,7 @@ async function sendChatImage(){
 function deleteMsg(id){ dbDeleteChat(id); render(); }
 
 /* ---------------------------------- BOOT ------------------------------------ */
-render();
+startApp();
 </script>
 </body>
 </html>
