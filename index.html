@@ -174,6 +174,19 @@
     background:rgba(255,255,255,0.18);border:none;color:#fff;font-size:16px;cursor:pointer;
     padding:6px 9px;border-radius:8px;margin-right:2px;
   }
+  /* -------- Money rain splash animation (shown briefly when the app opens) -------- */
+  .money-rain-container{
+    position:fixed;inset:0;pointer-events:none;z-index:9999;overflow:hidden;
+  }
+  .money-drop{
+    position:absolute;top:-60px;will-change:transform,opacity;
+    animation-name:moneyFall;animation-timing-function:ease-in;animation-fill-mode:forwards;
+    filter:drop-shadow(0 2px 3px rgba(0,0,0,0.25));
+  }
+  @keyframes moneyFall{
+    0%{transform:translateY(0) rotate(0deg);opacity:1;}
+    100%{transform:translateY(115vh) rotate(360deg);opacity:0.85;}
+  }
 </style>
 </head>
 <body>
@@ -364,6 +377,12 @@ function dbPromoteToAdmin(memberUid){
   if(u.role==="admin") return { ok:true };
   if(dbListAdmins().length>=3) return { error:"Maximum of 3 admins reached." };
   u.role = "admin";
+  // Login ID switches from GFM- to ADM- prefix now that this person has admin access.
+  DB.adminSeq += 1;
+  const newId = "ADM-" + String(DB.adminSeq).padStart(4,"0");
+  u.userId = newId;
+  const m = DB.members[memberUid];
+  if(m) m.userId = newId;
   return { ok:true };
 }
 // Demote an admin back to a normal member (same safeguard as Manage Admins: one admin must always remain).
@@ -373,7 +392,31 @@ function dbDemoteToMember(memberUid){
   if(u.role==="member") return { ok:true };
   if(dbListAdmins().length<=1) return { error:"At least one admin must remain." };
   u.role = "member";
+  // Login ID switches back from ADM- to GFM- prefix now that admin access is removed.
+  DB.memberSeq += 1;
+  const newId = generateUserId(DB.memberSeq);
+  u.userId = newId;
+  const m = DB.members[memberUid];
+  if(m) m.userId = newId;
   return { ok:true };
+}
+// Admins listed first (in admin order), then regular members — used everywhere a members list is shown.
+function sortMembersAdminsFirst(list){
+  return list.slice().sort((a,b)=>{
+    const au = DB.users.find(x=>x.uid===a.uid);
+    const bu = DB.users.find(x=>x.uid===b.uid);
+    const aAdmin = au && au.role==="admin" ? 0 : 1;
+    const bAdmin = bu && bu.role==="admin" ? 0 : 1;
+    if(aAdmin!==bAdmin) return aAdmin-bAdmin;
+    return (a.userId||"").localeCompare(b.userId||"");
+  });
+}
+// Small inline Call + WhatsApp icons — dropped in wherever a mobile number is shown so
+// admins/members can reach out directly without copying the number elsewhere.
+function contactIcons(mobile, name){
+  const clean = normalizeMobile(mobile);
+  const waMsg = `Hi ${name||""}`.trim();
+  return `<a href="tel:${clean}" onclick="event.stopPropagation();" title="Call" style="margin-left:10px;text-decoration:none;">📞</a><a href="${buildWhatsAppLink(mobile, waMsg)}" target="_blank" rel="noopener" onclick="event.stopPropagation();" title="WhatsApp" style="margin-left:8px;text-decoration:none;">💬</a>`;
 }
 // FIREBASE: replace with deleteDoc() on users/{uid} and members/{uid} (+ Cloud Function to delete Auth user)
 function dbDeleteMember(memberUid){
@@ -684,6 +727,17 @@ function backfillAdminMembers(){
   });
 }
 
+// Fixes login IDs for admins that were promoted before ADM- ids existed (or via older
+// saved data) — any admin whose ID doesn't already start with ADM- gets a fresh one.
+function backfillAdminIds(){
+  DB.users.filter(u=>u.role==="admin" && !String(u.userId||"").startsWith("ADM-")).forEach(u=>{
+    DB.adminSeq += 1;
+    const newId = "ADM-" + String(DB.adminSeq).padStart(4,"0");
+    u.userId = newId;
+    if(DB.members[u.uid]) DB.members[u.uid].userId = newId;
+  });
+}
+
 /* ===========================================================================
    CLOUD SYNC (FIREBASE) — makes data shared across every device/browser
    ===========================================================================
@@ -763,8 +817,10 @@ function startApp(){
   if(!CLOUD_SYNC_ENABLED){
     seed();
     backfillAdminMembers();
+    backfillAdminIds();
     restoreSession();
     render();
+    maybeShowMoneyRain();
     return;
   }
   firebase.initializeApp(FIREBASE_CONFIG);
@@ -777,13 +833,16 @@ function startApp(){
       if(snap.exists){
         applyCloudSnapshot(snap.data());
         backfillAdminMembers();
+        backfillAdminIds();
       } else {
         seed();
         backfillAdminMembers();
+        backfillAdminIds();
         cloudDocRef.set(DB).catch(err=>console.error("Initial cloud write failed:", err));
       }
       restoreSession();
       render();
+      maybeShowMoneyRain();
     }, err=>{
       console.error("Cloud sync error:", err);
       root.innerHTML = `<div class="empty-state">⚠️ Could not connect to the cloud database. Check your Firebase config / Firestore rules, or your internet connection.</div>`;
@@ -792,7 +851,7 @@ function startApp(){
 
   authClient.signInAnonymously().catch(err=>{
     console.error("Anonymous sign-in failed:", err);
-    seed(); backfillAdminMembers(); restoreSession(); render();
+    seed(); backfillAdminMembers(); backfillAdminIds(); restoreSession(); render(); maybeShowMoneyRain();
   });
 }
 
@@ -837,6 +896,35 @@ function toggleDarkMode(){
   render();
 }
 
+/* ---- Money rain splash: plays once when the app opens, auto-clears after 2s ---- */
+let moneyRainShown = false;
+function showMoneyRain(duration){
+  duration = duration || 2000;
+  try{
+    const container = document.createElement("div");
+    container.className = "money-rain-container";
+    const emojis = ["💰","💴"];
+    const count = 45;
+    for(let i=0;i<count;i++){
+      const el = document.createElement("div");
+      el.className = "money-drop";
+      el.textContent = emojis[Math.floor(Math.random()*emojis.length)];
+      el.style.left = (Math.random()*100) + "vw";
+      el.style.fontSize = (16 + Math.random()*22) + "px";
+      el.style.animationDuration = (3 + Math.random()*1.5) + "s";
+      el.style.animationDelay = (Math.random()*0.8) + "s";
+      container.appendChild(el);
+    }
+    document.body.appendChild(container);
+    setTimeout(()=>{ container.remove(); }, duration);
+  }catch(e){ /* animation is cosmetic — never let it break the app */ }
+}
+function maybeShowMoneyRain(){
+  if(moneyRainShown) return;
+  moneyRainShown = true;
+  showMoneyRain(4800);
+}
+
 /* --------------------------------- RENDER --------------------------------- */
 const root = document.getElementById("app");
 
@@ -847,7 +935,7 @@ function render(){
 
   const tabs = isAdmin()
     ? [["admin-dashboard","Dashboard"],["admin-members","Members"],["admin-loans","Loans"],["admin-transactions","Transactions"],["admin-reports","Reports"],["chat","Chat"]]
-    : [["member-dashboard","My Account"],["member-loan","Loan"],["member-history","History"],["chat","Chat"]];
+    : [["member-dashboard","My Account"],["member-members-list","Members"],["member-loan","Loan"],["member-history","History"],["chat","Chat"]];
 
   let body = "";
   switch(state.view){
@@ -867,6 +955,7 @@ function render(){
     case "admin-add-admin": body = viewAddAdmin(); break;
     case "change-password": body = viewChangePassword(); break;
     case "member-dashboard": body = viewMemberDashboard(); break;
+    case "member-members-list": body = viewMemberMembersList(); break;
     case "member-loan": body = viewMemberLoan(); break;
     case "member-history": body = viewMemberHistory(); break;
     case "member-upload": body = viewUploadProof(); break;
@@ -947,6 +1036,10 @@ function viewAdminDashboard(){
   const t = dbDashboardTotals();
   const bank = dbAvailableBankBalance();
   const pending = dbPendingSubmissions();
+  const members = dbListMembers();
+  const totalAdmins = dbListAdmins().length;
+  const u = currentUser();
+  const m = DB.members[u.uid];
   return `
   <div class="card" style="background:var(--primary);color:#fff;border:none;">
     <div style="font-size:12px;opacity:.85;">Available Bank Balance (lendable)</div>
@@ -958,6 +1051,8 @@ function viewAdminDashboard(){
     <div class="card"><div class="stat-value">${fmt(t.totalLoansGiven)}</div><div class="stat-label">Total Loans Given</div></div>
     <div class="card"><div class="stat-value">${fmt(t.totalInterestEarned)}</div><div class="stat-label">Total Interest Earned</div></div>
     <div class="card"><div class="stat-value">${t.pendingRepayments}</div><div class="stat-label">Pending Repayments</div></div>
+    <div class="card"><div class="stat-value">${members.length}</div><div class="stat-label">Total Members</div></div>
+    <div class="card"><div class="stat-value">${totalAdmins}</div><div class="stat-label">Total Admins</div></div>
   </div>
 
   ${pending.length ? `
@@ -991,8 +1086,11 @@ function viewAdminDashboard(){
   </div>
   <button class="btn outline" style="margin-top:8px;" onclick="go('admin-add-contribution',{selectedMemberUid:null})">➕ Add Contribution / Penalty (Manual)</button>
   <button class="btn outline" style="margin-top:8px;" onclick="go('admin-add-manual-interest')">➕ Add Loan Interest Payment (Manual)</button>
-  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-bank-details')">🏦 Manage Payment / Bank Details</button>
-  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-manage-admins')">👥 Manage Admins</button>`;
+  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-bank-details')">🏦 Manage Main Payment / Bank Details</button>
+  <div class="muted" style="font-size:11px;margin-top:4px;">This is the group's shared main account where everyone deposits contributions/EMIs. Any admin can update it.</div>
+  <button class="btn outline" style="margin-top:8px;" onclick="go('admin-manage-admins')">👥 Manage Admins</button>
+
+  ${renderMyPaymentDetailsCard(m)}`;
 }
 /* --------------------------- MANUAL CONTRIBUTION / PENALTY / INTEREST --------------------------- */
 function viewAddContribution(){
@@ -1130,24 +1228,28 @@ function viewAdminLoans(){
 
 /* ------------------------------- ADMIN MEMBERS ------------------------------ */
 function viewAdminMembers(){
-  const members = dbListMembers();
+  const members = sortMembersAdminsFirst(dbListMembers());
   const search = (state.memberSearch||"").toLowerCase();
   const filtered = members.filter(m=> !search || m.name.toLowerCase().includes(search) || m.mobile.includes(search) || m.userId.toLowerCase().includes(search));
   return `
+  <div class="muted" style="margin-bottom:8px;">Total Members: <b style="color:var(--text);">${members.length}</b> (incl. ${dbListAdmins().length} admin${dbListAdmins().length===1?"":"s"})</div>
   <input type="text" placeholder="Search by name, mobile, or ID" value="${state.memberSearch||""}" oninput="state.memberSearch=this.value; renderMembersListOnly();" />
   <div id="membersList">${renderMembersList(filtered)}</div>
   <button class="fab" onclick="go('admin-add-edit-member',{editingUid:null})">+</button>`;
 }
 function renderMembersList(list){
   if(!list.length) return `<div class="empty-state">No members found.</div>`;
-  return list.map(m=>`
+  return list.map(m=>{
+    const mu = DB.users.find(x=>x.uid===m.uid);
+    const isThisAdmin = mu && mu.role==="admin";
+    return `
     <div class="card" style="cursor:pointer;" onclick="go('admin-member-detail',{selectedMemberUid:'${m.uid}'})">
       <div class="row-between">
         <div style="display:flex;align-items:center;">
           <div class="avatar">${m.name[0].toUpperCase()}</div>
           <div>
-            <div style="font-weight:700;">${m.name}</div>
-            <div class="muted">${m.userId} • ${m.mobile}</div>
+            <div style="font-weight:700;">${m.name}${isThisAdmin?` <span class="badge" style="background:var(--primary);color:#fff;">Admin</span>`:""}</div>
+            <div class="muted">${m.userId} • ${m.mobile}${contactIcons(m.mobile, m.name)}</div>
           </div>
         </div>
         <div style="text-align:right;">
@@ -1159,11 +1261,12 @@ function renderMembersList(list){
         <a onclick="go('admin-add-edit-member',{editingUid:'${m.uid}'})">Edit</a>
         <a style="color:var(--danger);" onclick="confirmDeleteMember('${m.uid}','${m.name}')">Remove</a>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 function renderMembersListOnly(){
   const search = (state.memberSearch||"").toLowerCase();
-  const filtered = dbListMembers().filter(m=> !search || m.name.toLowerCase().includes(search) || m.mobile.includes(search) || m.userId.toLowerCase().includes(search));
+  const filtered = sortMembersAdminsFirst(dbListMembers()).filter(m=> !search || m.name.toLowerCase().includes(search) || m.mobile.includes(search) || m.userId.toLowerCase().includes(search));
   document.getElementById("membersList").innerHTML = renderMembersList(filtered);
 }
 function confirmDeleteMember(uidVal,name){
@@ -1234,7 +1337,7 @@ function viewManageAdmins(){
     <div class="list-row">
       <div>
         <div style="font-weight:700;">${a.name}${a.uid===me.uid?" (You)":""}</div>
-        <div class="muted">${a.userId} • ${a.mobile}</div>
+        <div class="muted">${a.userId} • ${a.mobile}${a.uid!==me.uid?contactIcons(a.mobile, a.name):""}</div>
       </div>
       ${a.uid!==me.uid && admins.length>1 ? `<a style="color:var(--danger);" onclick="removeAdmin('${a.uid}')">Remove</a>` : `<span></span>`}
     </div>`).join("")}
@@ -1316,13 +1419,13 @@ function viewMemberDetail(){
     <div class="row-between">
       <div>
         <div style="font-size:17px;font-weight:800;">${m.name}${isThisAdmin?` <span class="badge" style="background:var(--primary);color:#fff;">Admin</span>`:""}</div>
-        <div class="muted">${m.userId} • ${m.mobile}</div>
+        <div class="muted">${m.userId} • ${m.mobile}${contactIcons(m.mobile, m.name)}</div>
       </div>
     </div>
     ${u ? `
     <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
       <div class="list-row"><div>Login ID</div><div>${u.userId}</div></div>
-      <div class="list-row"><div>Mobile (login)</div><div>${u.mobile}</div></div>
+      <div class="list-row"><div>Mobile (login)</div><div>${u.mobile}${contactIcons(u.mobile, u.name)}</div></div>
       <div class="list-row"><div>Password</div><div>${u.password}</div></div>
     </div>` : ""}
     <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;">
@@ -1711,253 +1814,4 @@ function viewAdminReports(){
   const loans = dbListLoans();
   const txns = dbAllTransactions();
   const totalCollection = members.reduce((s,m)=>s+(m.totalDeposit||0),0);
-  const activeLoans = loans.filter(l=>l.status==="Active").length;
-  return `
-  <div class="card">
-    <h2 class="section-title" style="margin-top:0;">Monthly Summary</h2>
-    <div class="list-row"><div>Total Members</div><div>${members.length}</div></div>
-    <div class="list-row"><div>Total Collection</div><div>${fmt(totalCollection)}</div></div>
-    <div class="list-row"><div>Active Loans</div><div>${activeLoans}</div></div>
-    <div class="list-row"><div>Total Transactions</div><div>${txns.length}</div></div>
-  </div>
-  <div class="card">
-    <h2 class="section-title" style="margin-top:0;">Export Reports</h2>
-    <button class="btn" onclick="exportCsv()">Export Transactions (CSV / Excel)</button>
-    <button class="btn secondary" onclick="exportSummaryText()">Export Summary (Text)</button>
-  </div>`;
-}
-function exportCsv(){
-  const rows = ["Member,Type,Amount,Month,Date"];
-  dbAllTransactions().forEach(t=>{
-    const m = DB.members[t.memberUid];
-    rows.push(`${m?m.name:"Unknown"},${t.type},${t.amount},${t.month||""},${new Date(t.paidAt).toLocaleDateString()}`);
-  });
-  downloadBlob(rows.join("\n"), "transactions_report.csv", "text/csv");
-}
-function exportSummaryText(){
-  const t = dbDashboardTotals();
-  const text = `Group Finance Manager - Summary Report\n\nTotal Collection: ${fmt(t.totalCollection)}\nTotal Loans Given: ${fmt(t.totalLoansGiven)}\nTotal Interest Earned: ${fmt(t.totalInterestEarned)}\nPending Repayments: ${t.pendingRepayments}\n`;
-  downloadBlob(text, "summary_report.txt", "text/plain");
-}
-function downloadBlob(content, filename, type){
-  const blob = new Blob([content], {type});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-}
-
-/* -------------------------------- MEMBER VIEWS ------------------------------ */
-function viewMemberDashboard(){
-  const u = currentUser();
-  const m = DB.members[u.uid];
-  const loan = dbGetActiveLoan(u.uid);
-  return `
-  <div class="card" style="background:var(--primary);color:#fff;border:none;">
-    <div style="font-size:12px;opacity:.85;">Total Contributed</div>
-    <div style="font-size:26px;font-weight:800;margin-top:4px;">${fmt(m.totalDeposit)}</div>
-  </div>
-  <div class="grid2">
-    <div class="card"><div class="stat-value">${loan?fmt(loan.principal):"None"}</div><div class="stat-label">Loan Taken</div></div>
-    <div class="card"><div class="stat-value">${fmt(m.remainingBalance)}</div><div class="stat-label">Remaining Balance</div></div>
-  </div>
-  ${loan ? `
-  <div class="card">
-    <h2 class="section-title" style="margin-top:0;">EMI Details</h2>
-    <div class="list-row"><div>Fixed Monthly Principal</div><div>${fmt(loan.monthlyPrincipal)}</div></div>
-    <div class="list-row"><div>Interest Rate</div><div>${loan.interestRate}% / month (on balance)</div></div>
-    <div class="list-row"><div>This Month's Payment</div><div>${fmt((dbGetSchedule(loan.id).find(s=>s.status!=='Paid')||{}).emi || 0)}</div></div>
-    <div class="list-row"><div class="muted" style="font-size:11px;">— of which Principal / Interest</div><div class="muted" style="font-size:11px;">${(()=>{ const nx=dbGetSchedule(loan.id).find(s=>s.status!=='Paid'); return nx ? fmt(nx.principalPaid)+" / "+fmt(nx.interestPaid) : "—"; })()}</div></div>
-    <div class="list-row"><div>Duration</div><div>${loan.durationMonths} months</div></div>
-  </div>` : `<div class="card empty-state">You have no active loan right now.</div>`}
-  ${renderBankDetailsCard()}
-  ${isPastPenaltyDeadline() && !DB.contributions.some(c=>c.memberUid===u.uid && c.month===currentMonthLabel()) ? `<div class="banner" style="background:#FBE1E1;border-color:#F0B0B0;color:var(--danger);">⚠️ It's past the ${PENALTY_DEADLINE_DAY}th — this month's contribution is now late and will attract a ${fmt(PENALTY_AMOUNT)} penalty on top of ${fmt(CONTRIBUTION_AMOUNT)}.</div>` : ""}
-  <button class="btn outline" onclick="go('member-upload',{proofFor:'contribution'})">Upload Contribution Proof</button>
-
-  <div class="card">
-    <h2 class="section-title" style="margin-top:0;">My Bank / Payment Details</h2>
-    <div class="muted">Add your account details here so the admin can transfer money directly to you (e.g. loan disbursement, refunds).</div>
-    <label class="field-label">Account Holder Name</label>
-    <input type="text" id="myBdHolder" value="${(m.paymentDetails&&m.paymentDetails.accountHolder)||''}" placeholder="e.g. ${m.name}" />
-    <label class="field-label">Bank Name</label>
-    <input type="text" id="myBdBank" value="${(m.paymentDetails&&m.paymentDetails.bankName)||''}" placeholder="e.g. HDFC Bank" />
-    <label class="field-label">Account Number</label>
-    <input type="text" id="myBdAccNo" value="${(m.paymentDetails&&m.paymentDetails.accountNumber)||''}" placeholder="e.g. 1234567890123" />
-    <label class="field-label">IFSC Code</label>
-    <input type="text" id="myBdIfsc" value="${(m.paymentDetails&&m.paymentDetails.ifsc)||''}" placeholder="e.g. HDFC0001234" />
-    <label class="field-label">UPI ID</label>
-    <input type="text" id="myBdUpi" value="${(m.paymentDetails&&m.paymentDetails.upi)||''}" placeholder="e.g. yourname@upi" />
-    <label class="field-label">QR Code Image (optional)</label>
-    <input type="file" id="myBdQrFile" accept="image/*" onchange="previewMyBankQr()" />
-    <div id="myBdQrPreview" style="margin-top:10px;">${(m.paymentDetails&&m.paymentDetails.qrImage)?`<img src="${m.paymentDetails.qrImage}" class="chat-img" style="max-height:180px;"/>`:""}</div>
-    <button class="btn" onclick="saveMyPaymentDetails()">Save My Details</button>
-  </div>`;
-}
-let pendingMyBankQrBase64 = null;
-async function previewMyBankQr(){
-  const file = document.getElementById("myBdQrFile").files[0];
-  if(!file) return;
-  pendingMyBankQrBase64 = await fileToBase64(file);
-  document.getElementById("myBdQrPreview").innerHTML = `<img src="${pendingMyBankQrBase64}" class="chat-img" style="max-height:180px;"/>`;
-}
-function saveMyPaymentDetails(){
-  const u = currentUser();
-  const details = {
-    accountHolder: document.getElementById("myBdHolder").value.trim(),
-    bankName: document.getElementById("myBdBank").value.trim(),
-    accountNumber: document.getElementById("myBdAccNo").value.trim(),
-    ifsc: document.getElementById("myBdIfsc").value.trim(),
-    upi: document.getElementById("myBdUpi").value.trim(),
-  };
-  if(pendingMyBankQrBase64) details.qrImage = pendingMyBankQrBase64;
-  dbUpdateMemberPaymentDetails(u.uid, details);
-  pendingMyBankQrBase64 = null;
-  alert("Your payment details are saved. The admin can now see them to transfer money to you.");
-  render();
-}
-
-function viewMemberLoan(){
-  const u = currentUser();
-  const loan = dbGetActiveLoan(u.uid);
-  const allLoans = dbListLoans().filter(l=>l.memberUid===u.uid).sort((a,b)=> new Date(b.startDate)-new Date(a.startDate));
-  const closedLoans = allLoans.filter(l=>l.status==="Closed");
-  const closedLoansHtml = closedLoans.length ? `
-    <h2 class="section-title">Closed Loans</h2>
-    ${closedLoans.map(l=>`
-      <div class="card">
-        <div class="row-between">
-          <div><div style="font-weight:700;">${fmt(l.principal)}</div><div class="muted">Closed ${new Date(l.closedDate).toLocaleDateString()}${l.closedEarly?' (Foreclosed)':''}</div></div>
-          <a onclick="generateNOC('${l.id}')">Download NOC</a>
-        </div>
-      </div>`).join("")}` : "";
-  if(!loan) return `<div class="empty-state">You don't have an active loan right now.</div>${closedLoansHtml}`;
-  const schedule = dbGetSchedule(loan.id);
-  return `
-  <div class="card" style="background:var(--primary);color:#fff;border:none;">
-    <div style="font-size:12px;opacity:.85;">Loan Amount</div>
-    <div style="font-size:24px;font-weight:800;margin:4px 0 12px;">${fmt(loan.principal)}</div>
-    <div style="display:flex;justify-content:space-between;">
-      <div><div style="font-weight:800;">${fmt(loan.monthlyPrincipal)}</div><div style="font-size:10px;opacity:.85;">Fixed Principal/mo</div></div>
-      <div><div style="font-weight:800;">${loan.interestRate}%/mo</div><div style="font-size:10px;opacity:.85;">Rate (on balance)</div></div>
-      <div><div style="font-weight:800;">${loan.durationMonths} mo</div><div style="font-size:10px;opacity:.85;">Duration</div></div>
-    </div>
-  </div>
-  <div class="banner">💡 Your monthly payment goes down over time — interest is charged only on your remaining balance, which shrinks every month.</div>
-  <h2 class="section-title">Repayment Schedule</h2>
-  ${schedule.map(s=>{
-    const overdue = s.status!=="Paid" && isOverdue(s.dueDate);
-    return `<div class="card">
-      <div class="row-between">
-        <div>
-          <div style="font-weight:700;">Month ${s.month}</div>
-          <div class="muted">Due: ${new Date(s.dueDate).toLocaleDateString()}</div>
-        </div>
-        <span class="badge ${s.status==='Paid'?'paid':overdue?'overdue':'pending'}">${s.status==='Paid'?'Paid':overdue?'Overdue':'Pending'}</span>
-      </div>
-      <div class="row-between" style="margin-top:8px;">
-        <div class="muted">Principal ${fmt(s.principalPaid)} + Interest ${fmt(s.interestPaid)}</div>
-        <div style="font-weight:800;">${fmt(s.emi)}</div>
-      </div>
-      ${s.status!=="Paid" ? `<div style="text-align:right;margin-top:4px;"><a onclick="go('member-upload',{proofFor:'emi',proofLoanId:'${loan.id}',proofMonth:${s.month}})">Upload Proof</a></div>` : ""}
-    </div>`;
-  }).join("")}
-  ${renderBankDetailsCard()}
-  ${closedLoansHtml}`;
-}
-
-function viewMemberHistory(){
-  const u = currentUser();
-  const contribs = dbListContributions(u.uid).map(c=>({type:"Contribution", amount:c.amount, label:c.month+(c.penalty?` (incl. ${fmt(c.penalty)} penalty)`:""), status:"Paid"}));
-  const loan = dbGetActiveLoan(u.uid);
-  const emis = loan ? dbGetSchedule(loan.id).map(s=>({type:"EMI Payment", amount:s.emi, label:"Month "+s.month, status:s.status})) : [];
-  const items = [...contribs, ...emis];
-  return items.length ? items.map(i=>`
-    <div class="card">
-      <div class="row-between">
-        <div><div style="font-weight:700;">${i.type}</div><div class="muted">${i.label}</div></div>
-        <div style="font-weight:700;">${fmt(i.amount)}</div>
-        <span class="badge ${i.status==='Paid'?'paid':'pending'}">${i.status}</span>
-      </div>
-    </div>`).join("") : `<div class="empty-state">No payment history yet.</div>`;
-}
-
-function viewUploadProof(){
-  const label = state.proofFor==="emi" ? `Upload proof for Month ${state.proofMonth} EMI` : "Upload Contribution Proof";
-  const showPenaltyWarning = state.proofFor!=="emi" && isPastPenaltyDeadline();
-  return `
-  <h2 class="section-title" style="margin-top:0;">${label}</h2>
-  ${showPenaltyWarning ? `<div class="banner" style="background:#FBE1E1;border-color:#F0B0B0;color:var(--danger);">⚠️ Contributions must be deposited by the ${PENALTY_DEADLINE_DAY}th of the month. Since it's past that date, a ${fmt(PENALTY_AMOUNT)} late penalty will be added to your ${fmt(CONTRIBUTION_AMOUNT)} contribution once approved.</div>` : ""}
-  <input type="file" id="proofFile" accept="image/*" onchange="previewProof()" />
-  <div id="proofPreview" style="margin-top:10px;"></div>
-  <button class="btn" onclick="submitProof()">Submit for Review</button>
-  <button class="btn secondary" onclick="go(${isAdmin()?"'admin-dashboard'":"'member-dashboard'"})">Cancel</button>`;
-}
-let pendingProofBase64 = null;
-async function previewProof(){
-  const file = document.getElementById("proofFile").files[0];
-  if(!file) return;
-  pendingProofBase64 = await fileToBase64(file);
-  document.getElementById("proofPreview").innerHTML = `<img src="${pendingProofBase64}" class="chat-img" style="max-height:200px;"/>`;
-}
-function submitProof(){
-  if(!pendingProofBase64){ alert("Please select a payment screenshot first."); return; }
-  const u = currentUser();
-  if(state.proofFor==="emi"){
-    dbSubmitProof(u.uid, "EMI", state.proofLoanId, state.proofMonth, pendingProofBase64);
-  } else {
-    dbSubmitProof(u.uid, "Contribution", null, currentMonthLabel(), pendingProofBase64);
-  }
-  pendingProofBase64 = null;
-  alert("Submitted for admin review. It will reflect in your account once approved.");
-  go(isAdmin() ? "admin-dashboard" : "member-dashboard");
-}
-
-/* ---------------------------------- CHAT ------------------------------------ */
-function viewChat(){
-  const u = currentUser();
-  const messages = DB.chat.map(msg=>{
-    const mine = msg.senderUid===u.uid;
-    return `<div class="chat-bubble-wrap" style="justify-content:${mine?'flex-end':'flex-start'};">
-      <div class="chat-bubble ${mine?'mine':'other'}">
-        ${!mine ? `<div class="chat-sender">${msg.senderName}</div>` : ""}
-        ${msg.imageUrl ? `<img src="${msg.imageUrl}" class="chat-img"/>` : `<div>${msg.text}</div>`}
-        ${isAdmin() ? `<div style="text-align:right;margin-top:4px;"><a style="font-size:10px;color:${mine?'#cfe0ff':'var(--danger)'};" onclick="deleteMsg('${msg.id}')">delete</a></div>` : ""}
-      </div>
-    </div>`;
-  }).join("");
-  setTimeout(()=>{ const c=document.getElementById("chatScroll"); if(c) c.scrollTop=c.scrollHeight; },0);
-  return `
-  <div id="chatScroll" style="max-height:60vh;overflow-y:auto;margin-bottom:10px;">
-    ${messages || `<div class="empty-state">No messages yet. Say hello 👋</div>`}
-  </div>
-  <div class="chat-input-row" style="position:relative;">
-    <input type="file" id="chatImgInput" accept="image/*" style="display:none;" onchange="sendChatImage()" />
-    <button class="icon-btn" style="color:var(--primary);" onclick="document.getElementById('chatImgInput').click()">🖼️</button>
-    <input type="text" id="chatText" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendChatText();" />
-    <button class="icon-btn" style="background:var(--primary);border-radius:50%;" onclick="sendChatText()">➤</button>
-  </div>`;
-}
-function sendChatText(){
-  const u = currentUser();
-  const el = document.getElementById("chatText");
-  const text = el.value.trim();
-  if(!text) return;
-  dbSendChat(u.uid, u.name, text, null);
-  el.value = "";
-  render();
-}
-async function sendChatImage(){
-  const u = currentUser();
-  const file = document.getElementById("chatImgInput").files[0];
-  if(!file) return;
-  const base64 = await fileToBase64(file);
-  dbSendChat(u.uid, u.name, null, base64);
-  render();
-}
-function deleteMsg(id){ dbDeleteChat(id); render(); }
-
-/* ---------------------------------- BOOT ------------------------------------ */
-startApp();
-</script>
-</body>
-</html>
+  const activeLoans = loans.filter(l=>l.stat
