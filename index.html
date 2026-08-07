@@ -314,6 +314,8 @@ function dbAddAdmin(name, mobile){
   const tempPassword = generateTempPassword();
   const newUid = uid("adm");
   DB.users.push({ uid:newUid, userId, name, mobile:clean, password:tempPassword, role:"admin" });
+  // Admins are also tracked as members (contributions/loans) exactly like everyone else.
+  DB.members[newUid] = { uid:newUid, userId, name, mobile:clean, totalDeposit:0, remainingBalance:0, activeLoanId:null, paymentDetails:{ accountHolder:"", bankName:"", accountNumber:"", ifsc:"", upi:"", qrImage:null } };
   return { uid:newUid, userId, mobile:clean, tempPassword };
 }
 function dbListAdmins(){ return DB.users.filter(u=>u.role==="admin"); }
@@ -321,6 +323,7 @@ function dbRemoveAdmin(adminUid){
   if(dbListAdmins().length<=1) return { error:"At least one admin must remain." };
   const idx = DB.users.findIndex(u=>u.uid===adminUid);
   if(idx>=0) DB.users.splice(idx,1);
+  delete DB.members[adminUid];
   return { ok:true };
 }
 function dbChangePassword(userUid, oldPassword, newPassword){
@@ -347,13 +350,40 @@ function dbEditMember(memberUid, name, mobile){
   const u = DB.users.find(x=>x.uid===memberUid);
   const m = DB.members[memberUid];
   const clean = normalizeMobile(mobile);
+  if(DB.users.some(x=>x.uid!==memberUid && x.mobile===clean)){
+    return { error:"Another user already has this mobile number." };
+  }
   if(u){ u.name=name; u.mobile=clean; }
   if(m){ m.name=name; m.mobile=clean; }
+  return { ok:true };
+}
+// Promote a member to admin (keeps the same uid/history/contributions/loans — just the role & access level change).
+function dbPromoteToAdmin(memberUid){
+  const u = DB.users.find(x=>x.uid===memberUid);
+  if(!u) return { error:"User not found." };
+  if(u.role==="admin") return { ok:true };
+  if(dbListAdmins().length>=3) return { error:"Maximum of 3 admins reached." };
+  u.role = "admin";
+  return { ok:true };
+}
+// Demote an admin back to a normal member (same safeguard as Manage Admins: one admin must always remain).
+function dbDemoteToMember(memberUid){
+  const u = DB.users.find(x=>x.uid===memberUid);
+  if(!u) return { error:"User not found." };
+  if(u.role==="member") return { ok:true };
+  if(dbListAdmins().length<=1) return { error:"At least one admin must remain." };
+  u.role = "member";
+  return { ok:true };
 }
 // FIREBASE: replace with deleteDoc() on users/{uid} and members/{uid} (+ Cloud Function to delete Auth user)
 function dbDeleteMember(memberUid){
+  const u = DB.users.find(x=>x.uid===memberUid);
+  if(u && u.role==="admin" && dbListAdmins().length<=1){
+    return { error:"At least one admin must remain — can't remove the last admin." };
+  }
   DB.users = DB.users.filter(x=>x.uid!==memberUid);
   delete DB.members[memberUid];
+  return { ok:true };
 }
 // FIREBASE: replace with a Firestore query on 'members' collection
 function dbListMembers(){ return Object.values(DB.members); }
@@ -556,7 +586,19 @@ function dbAvailableBankBalance(){
 // time. That admin can then add up to two more admins (equal, full admin power) from
 // Dashboard → "Add Another Admin", and members whenever they're ready.
 function seed(){
-  DB.users.push({ uid:uid("adm"), userId:"ADM-0001", name:"Admin", mobile:"9000000001", password:"admin123", role:"admin" });
+  const adminUid = uid("adm");
+  DB.users.push({ uid:adminUid, userId:"ADM-0001", name:"Admin", mobile:"9000000001", password:"admin123", role:"admin" });
+  DB.members[adminUid] = { uid:adminUid, userId:"ADM-0001", name:"Admin", mobile:"9000000001", totalDeposit:0, remainingBalance:0, activeLoanId:null, paymentDetails:{ accountHolder:"", bankName:"", accountNumber:"", ifsc:"", upi:"", qrImage:null } };
+}
+
+// Ensures every admin user has a matching Members entry — needed for data that
+// was already deployed/saved before admins started being tracked as members too.
+function backfillAdminMembers(){
+  DB.users.filter(u=>u.role==="admin").forEach(u=>{
+    if(!DB.members[u.uid]){
+      DB.members[u.uid] = { uid:u.uid, userId:u.userId, name:u.name, mobile:u.mobile, totalDeposit:0, remainingBalance:0, activeLoanId:null, paymentDetails:{ accountHolder:"", bankName:"", accountNumber:"", ifsc:"", upi:"", qrImage:null } };
+    }
+  });
 }
 
 /* ===========================================================================
@@ -637,6 +679,7 @@ function applyCloudSnapshot(data){
 function startApp(){
   if(!CLOUD_SYNC_ENABLED){
     seed();
+    backfillAdminMembers();
     restoreSession();
     render();
     return;
@@ -650,8 +693,10 @@ function startApp(){
     cloudDocRef.onSnapshot(snap=>{
       if(snap.exists){
         applyCloudSnapshot(snap.data());
+        backfillAdminMembers();
       } else {
         seed();
+        backfillAdminMembers();
         cloudDocRef.set(DB).catch(err=>console.error("Initial cloud write failed:", err));
       }
       restoreSession();
@@ -664,7 +709,7 @@ function startApp(){
 
   authClient.signInAnonymously().catch(err=>{
     console.error("Anonymous sign-in failed:", err);
-    seed(); restoreSession(); render();
+    seed(); backfillAdminMembers(); restoreSession(); render();
   });
 }
 
@@ -1013,8 +1058,24 @@ function renderMembersListOnly(){
 }
 function confirmDeleteMember(uidVal,name){
   if(confirm(`Remove ${name}? This deletes their login. History is preserved.`)){
-    dbDeleteMember(uidVal); render();
+    const res = dbDeleteMember(uidVal);
+    if(res && res.error){ alert(res.error); return; }
+    if(state.view==="admin-member-detail") go("admin-members"); else render();
   }
+}
+function changeRole(uidVal, newRole, name){
+  const msg = newRole==="admin"
+    ? `Make ${name} an admin? They'll get full admin access (same power as you), while keeping all their existing contribution/loan history.`
+    : `Make ${name} a normal member? They'll lose admin access immediately, while keeping all their existing contribution/loan history.`;
+  if(!confirm(msg)) return;
+  const res = newRole==="admin" ? dbPromoteToAdmin(uidVal) : dbDemoteToMember(uidVal);
+  if(res && res.error){ alert(res.error); return; }
+  if(uidVal===currentUser().uid && newRole==="member"){
+    state.view = "member-dashboard"; // demoting yourself — drop into the member view immediately
+    render();
+    return;
+  }
+  render();
 }
 
 function viewAddEditMember(){
@@ -1024,18 +1085,20 @@ function viewAddEditMember(){
   <label class="field-label">Full Name</label>
   <input type="text" id="memName" value="${editing?editing.name:""}" placeholder="e.g. Ramesh Kumar" />
   <label class="field-label">Mobile Number</label>
-  <input type="tel" id="memMobile" value="${editing?editing.mobile:""}" placeholder="e.g. 9876543210" ${editing?"disabled":""} />
+  <input type="tel" id="memMobile" value="${editing?editing.mobile:""}" placeholder="e.g. 9876543210" />
+  ${editing ? `<div class="muted" style="font-size:11px;margin-top:-6px;">This is also their login mobile number — changing it changes how they log in.</div>` : ""}
   <button class="btn" onclick="saveMember(${editing?`'${state.editingUid}'`:"null"})">${editing ? "Save Changes" : "Add Member & Generate Login"}</button>
   <div id="credsResult"></div>
-  <button class="btn secondary" onclick="go('admin-members')">Back</button>`;
+  <button class="btn secondary" onclick="go(${editing?`'admin-member-detail'`:`'admin-members'`})">Back</button>`;
 }
 function saveMember(existingUid){
   const name = document.getElementById("memName").value.trim();
   const mobile = document.getElementById("memMobile").value.trim();
   if(!name || !mobile){ alert("Please enter both name and mobile number."); return; }
   if(existingUid){
-    dbEditMember(existingUid, name, mobile);
-    go("admin-members");
+    const res = dbEditMember(existingUid, name, mobile);
+    if(res && res.error){ alert(res.error); return; }
+    go("admin-member-detail", {selectedMemberUid:existingUid});
   } else {
     const result = dbAddMember(name, mobile);
     document.getElementById("credsResult").innerHTML = `
@@ -1132,14 +1195,33 @@ function submitChangePassword(){
 function viewMemberDetail(){
   const m = DB.members[state.selectedMemberUid];
   if(!m) return `<div class="empty-state">Member not found.</div>`;
+  const u = DB.users.find(x=>x.uid===m.uid);
+  const isThisAdmin = u && u.role==="admin";
   const loan = dbGetActiveLoan(m.uid);
   const schedule = loan ? dbGetSchedule(loan.id) : [];
   const contribs = dbListContributions(m.uid);
   const allLoans = dbListLoans().filter(l=>l.memberUid===m.uid).sort((a,b)=> new Date(b.startDate)-new Date(a.startDate));
   return `
   <div class="card">
-    <div style="font-size:17px;font-weight:800;">${m.name}</div>
-    <div class="muted">${m.userId} • ${m.mobile}</div>
+    <div class="row-between">
+      <div>
+        <div style="font-size:17px;font-weight:800;">${m.name}${isThisAdmin?` <span class="badge" style="background:var(--primary);color:#fff;">Admin</span>`:""}</div>
+        <div class="muted">${m.userId} • ${m.mobile}</div>
+      </div>
+    </div>
+    ${u ? `
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+      <div class="list-row"><div>Login ID</div><div>${u.userId}</div></div>
+      <div class="list-row"><div>Mobile (login)</div><div>${u.mobile}</div></div>
+      <div class="list-row"><div>Password</div><div>${u.password}</div></div>
+    </div>` : ""}
+    <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;">
+      <a onclick="go('admin-add-edit-member',{editingUid:'${m.uid}'})">Edit</a>
+      <a style="color:var(--danger);" onclick="confirmDeleteMember('${m.uid}','${m.name}')">Remove</a>
+      ${isThisAdmin
+        ? `<a style="color:var(--warning);" onclick="changeRole('${m.uid}','member','${m.name}')">Make Normal Member</a>`
+        : `<a style="color:var(--primary);" onclick="changeRole('${m.uid}','admin','${m.name}')">Make Admin</a>`}
+    </div>
     <div class="grid2" style="margin-top:12px;">
       <div><div class="stat-value" style="color:var(--primary);font-size:15px;">${fmt(m.totalDeposit)}</div><div class="stat-label">Total Deposit</div></div>
       <div><div class="stat-value" style="color:var(--primary);font-size:15px;">${fmt(m.remainingBalance)}</div><div class="stat-label">Remaining Balance</div></div>
